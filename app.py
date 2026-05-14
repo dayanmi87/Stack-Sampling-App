@@ -51,6 +51,11 @@ def load_data():
                 if not df.empty:
                     df['date'] = pd.to_datetime(df['date'], errors='coerce')
                     df = df.dropna(subset=['date'])
+                    # Normalise pollutant names on load – collapse any consecutive whitespace so that
+                    # "תחמוצות  גופרית" and "תחמוצות גופרית" are treated the same.  This ensures
+                    # consistency across sessions and between uploads and persisted data.
+                    if 'pollutant' in df.columns:
+                        df['pollutant'] = df['pollutant'].astype(str).apply(lambda x: " ".join(x.split()))
                 return df, data.get("thresholds", {}), set(data.get("hashes", [])), data.get("chimney_names", {})
         except: pass
     return pd.DataFrame(columns=["pollutant", "concentration", "date", "chimney_id", "filename"]), {}, set(), {}
@@ -88,23 +93,79 @@ def to_excel_custom(df, chimney_name, pollutant_name):
     return output.getvalue()
 
 def process_excel(uploaded_file):
+    """
+    Parse a raw Excel file exported from the Ministry of Environment stack sampling form.
+
+    This helper is deliberately resilient to minor variations in the underlying file:
+    * The stack ID ("זיהוי ארובה:") is expected to appear on row 3, immediately to the right of the label.
+    * The sampling date ("תאריך הדיגום:") is expected to appear on row 7, immediately to the right of the label.
+    * Measurement results can appear in one of several columns (normalised, measured, LOQ or LOD).  The
+      function will always try the normalised value first, then the measured concentration, then the
+      quantification limit and finally the detection limit.  If the value is stored as a string beginning
+      with "<" (e.g. "< LOQ" or "< LOD") the numeric part will be extracted and used.  Any row that
+      cannot be converted into a float will be skipped rather than causing the entire import to fail.
+    * Pollutant names are normalised by collapsing consecutive whitespace into a single space and
+      trimming leading/trailing spaces.  This helps consolidate variants like "תחמוצות  גופרית" and
+      "תחמוצות גופרית" under a single key.
+    """
     try:
+        # Read the file without assuming headers – the template uses fixed offsets.
         df_raw = pd.read_excel(uploaded_file, header=None)
+
+        # Extract the chimney identifier and sampling date from their respective cells.
         chimney_id = str(df_raw.iloc[3, 7]).strip()
         sampling_date = pd.to_datetime(df_raw.iloc[7, 13], errors='coerce')
-        if pd.isnull(sampling_date): return None, None
+        if pd.isnull(sampling_date):
+            return None, None
+
         data_rows = []
+        # Iterate over potential result rows.  The results start at row 10 in the provided template.
         for i in range(10, len(df_raw)):
-            pollutant = str(df_raw.iloc[i, 2]).strip()
-            if not pollutant or pollutant.lower() == "nan": continue
+            raw_pollutant = df_raw.iloc[i, 2] if df_raw.shape[1] > 2 else None
+            pollutant = str(raw_pollutant).strip() if raw_pollutant is not None else ""
+            if not pollutant or pollutant.lower() == "nan":
+                continue
+            # Normalise pollutant name by squeezing extra spaces and stripping.
+            pollutant = " ".join(pollutant.split())
+
+            # Attempt to retrieve a numeric concentration from the preferred columns.
+            concentration = None
             for col_idx in [16, 13, 15, 14]:
+                # Guard against files with fewer columns
+                if col_idx >= df_raw.shape[1]:
+                    continue
                 val = df_raw.iloc[i, col_idx]
-                if pd.notnull(val) and str(val).strip() != "":
-                    data_rows.append({"pollutant": pollutant, "concentration": round(float(val), 1), 
-                                     "date": sampling_date, "chimney_id": chimney_id, "filename": uploaded_file.name})
-                    break
+                if pd.isnull(val) or str(val).strip() == "":
+                    continue
+                # Convert the value to a float.  Some values may be strings like "< LOQ" or "<0.5".
+                val_str = str(val).strip()
+                # If the value begins with '<' (below detection/quantification), strip the symbol and
+                # attempt to interpret the remainder.  If conversion fails, skip this column.
+                if val_str.startswith("<"):
+                    val_str = val_str.lstrip("<").strip()
+                try:
+                    numeric_val = float(val_str)
+                except Exception:
+                    # If we can't coerce to a number then move on to the next candidate column.
+                    continue
+                concentration = round(numeric_val, 1)
+                break
+            # Only record rows where we were able to derive a concentration
+            if concentration is not None:
+                data_rows.append({
+                    "pollutant": pollutant,
+                    "concentration": concentration,
+                    "date": sampling_date,
+                    "chimney_id": chimney_id,
+                    "filename": uploaded_file.name
+                })
+        # Build a DataFrame from all parsed rows.  If no rows were parsed return None
+        if not data_rows:
+            return None, chimney_id
         return pd.DataFrame(data_rows), chimney_id
-    except: return None, None
+    except Exception:
+        # Suppress noisy traceback for end users – a silent failure will be reported upstream.
+        return None, None
 
 # --- Session State ---
 if 'db' not in st.session_state:
@@ -122,7 +183,9 @@ with st.sidebar:
         added = False
         for file in uploaded_files:
             f_hash = hashlib.md5(file.getvalue()).hexdigest()
-            if f_hash not in st.session_state.file_hashes:
+            # Allow a file to be re‑uploaded if its name no longer exists in the DB.  This
+            # accommodates deletions where the hash remains in the set but the rows have been purged.
+            if f_hash not in st.session_state.file_hashes or file.name not in st.session_state.db.get('filename', pd.Series(dtype=str)).unique():
                 new_data, _ = process_excel(file)
                 if new_data is not None:
                     st.session_state.db = pd.concat([st.session_state.db, new_data], ignore_index=True)
