@@ -246,35 +246,46 @@ if 'db' not in st.session_state:
 # --- ממשק משתמש ---
 
 st.title("📊 Stack Monitoring Analytics")
+# Place the tabs and file uploader on the same row.  The left column holds the tabs and the right column holds the uploader.
+col_tabs, col_upload = st.columns([8, 2])
+with col_upload:
+    st.markdown("### 📥 העלאת נתונים")
+    uploaded_files = st.file_uploader(
+        "בחר קבצי אקסל (XLSX)",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+        key="file_upload"
+    )
+if uploaded_files:
+    added = False
+    # Determine existing filenames for duplicate detection
+    existing_filenames = (
+        st.session_state.db['filename'].unique()
+        if not st.session_state.db.empty else []
+    )
+    for file in uploaded_files:
+        f_hash = hashlib.md5(file.getvalue()).hexdigest()
+        # Allow a file to be re‑uploaded if its name no longer exists in the DB.
+        if f_hash not in st.session_state.file_hashes or file.name not in existing_filenames:
+            new_data, _ = process_excel(file)
+            if new_data is not None:
+                st.session_state.db = pd.concat([st.session_state.db, new_data], ignore_index=True)
+                st.session_state.file_hashes.add(f_hash)
+                added = True
+    if added:
+        st.session_state.db['date'] = pd.to_datetime(st.session_state.db['date'])
+        save_data(
+            st.session_state.db,
+            st.session_state.thresholds,
+            st.session_state.file_hashes,
+            st.session_state.chimney_names,
+            st.session_state.plants,
+        )
+        st.rerun()
 
-with st.sidebar:
-    st.markdown("## 📥 העלאת נתונים")
-    uploaded_files = st.file_uploader("בחר קבצי אקסל (XLSX)", type=["xlsx"], accept_multiple_files=True, label_visibility="collapsed")
-    
-    if uploaded_files:
-        added = False
-        for file in uploaded_files:
-            f_hash = hashlib.md5(file.getvalue()).hexdigest()
-            # Allow a file to be re‑uploaded if its name no longer exists in the DB.  This
-            # accommodates deletions where the hash remains in the set but the rows have been purged.
-            if f_hash not in st.session_state.file_hashes or file.name not in st.session_state.db.get('filename', pd.Series(dtype=str)).unique():
-                new_data, _ = process_excel(file)
-                if new_data is not None:
-                    st.session_state.db = pd.concat([st.session_state.db, new_data], ignore_index=True)
-                    st.session_state.file_hashes.add(f_hash)
-                    added = True
-        if added:
-            st.session_state.db['date'] = pd.to_datetime(st.session_state.db['date'])
-            save_data(
-                st.session_state.db,
-                st.session_state.thresholds,
-                st.session_state.file_hashes,
-                st.session_state.chimney_names,
-                st.session_state.plants,
-            )
-            st.rerun()
-
-tab1, tab2, tab3 = st.tabs(["📈 דשבורד", "⚙️ הגדרות ארובות", "💾 ניהול מסד נתונים"])
+# Build the tabbed interface within the left column
+tab1, tab2, tab3 = col_tabs.tabs(["📈 דשבורד", "⚙️ הגדרות ארובות", "💾 ניהול מסד נתונים"])
 
 with tab1:
     if not st.session_state.db.empty:
@@ -297,66 +308,85 @@ with tab1:
             selected_id = [k for k, v in id_to_label.items() if v == selected_label][0]
             # Filter data for the selected chimney
             c_data = st.session_state.db[st.session_state.db['chimney_id'] == selected_id]
-            # Iterate over pollutants and draw graphs
-            for poll in sorted(c_data['pollutant'].unique()):
-                poll_data = c_data[c_data['pollutant'] == poll].sort_values('date')
-                threshold = int(st.session_state.thresholds.get(selected_id, {}).get(poll, 0))
-                st.markdown(f'<div class="graph-card">', unsafe_allow_html=True)
-                col_spacer, col_dl = st.columns([10, 1.5])
-                with col_dl:
-                    # Export only this pollutant and chimney
-                    df_for_excel = poll_data[['date', 'concentration']].copy()
-                    df_for_excel['date'] = df_for_excel['date'].dt.strftime('%d/%m/%Y')
-                    excel_data = to_excel_custom(df_for_excel, selected_label, poll)
-                    st.download_button("Excel 📥", data=excel_data, file_name=f"{selected_label}_{poll}.xlsx", key=f"dl_{selected_id}_{poll}")
-                # Create figure
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=poll_data['date'].dt.strftime('%d/%m/%Y'),
-                    y=poll_data['concentration'],
-                    mode='lines+markers',
-                    line=dict(color='#3b82f6', width=3),
-                    marker=dict(size=8, color='#1e293b', line=dict(width=2, color='#3b82f6')),
-                    fill='tozeroy',
-                    fillcolor='rgba(59, 130, 246, 0.05)',
-                    name=f"ריכוז (מ\"ג/מק\"ת)",
-                    hovertemplate="תאריך: %{x}<br>ריכוז: %{y:.1f} מ\"ג/מק\"ת<extra></extra>"
-                ))
-                if threshold > 0:
-                    fig.add_hline(y=threshold, line_dash="dash", line_color="#ef4444",
-                                  annotation_text=f"סף תקן: {threshold} מ\"ג/מק\"ת", annotation_position="top left")
-                fig.update_layout(
-                    title={
-                        'text': f"<b>{selected_label} - {poll}</b><br><span style='font-size:14px; color:gray;'>(מ\"ג/מק\"ת)</span>",
-                        'y': 0.95, 'x': 0.5, 'xanchor': 'center', 'yanchor': 'top'
-                    },
-                    # Slightly smaller graph height to allow multiple plots to fit comfortably on screen
-                    height=280,
-                    margin=dict(l=20, r=20, t=70, b=20),
-                    template="plotly_white",
-                    xaxis=dict(type='category', gridcolor='#f0f2f6', title="תאריך דיגום"),
-                    yaxis=dict(gridcolor='#f0f2f6', title="ריכוז (מ\"ג/מק\"ת)"),
-                    hovermode="x unified",
-                    dragmode="zoom"
-                )
-                st.plotly_chart(
-                    fig,
-                    use_container_width=True,
-                    config={
-                        'displaylogo': False,
-                        'toImageButtonOptions': {
-                            'format': 'png',
-                            'filename': f'{selected_label}_{poll}',
-                            'height': 800,
-                            'width': 1200,
-                            'scale': 2
-                        }
-                    },
-                    key=f"chart_{selected_id}_{poll}"
-                )
-                st.markdown('</div>', unsafe_allow_html=True)
+            # Iterate over pollutants and draw graphs two per row
+            polls_list = sorted(c_data['pollutant'].unique())
+            for i in range(0, len(polls_list), 2):
+                row_polls = polls_list[i:i+2]
+                # Create two columns for side-by-side charts
+                col_graphs = st.columns(2)
+                for j, poll in enumerate(row_polls):
+                    poll_data = c_data[c_data['pollutant'] == poll].sort_values('date')
+                    threshold = int(st.session_state.thresholds.get(selected_id, {}).get(poll, 0))
+                    with col_graphs[j]:
+                        st.markdown(f'<div class="graph-card">', unsafe_allow_html=True)
+                        col_spacer, col_dl = st.columns([10, 1.5])
+                        with col_dl:
+                            # Export only this pollutant and chimney
+                            df_for_excel = poll_data[['date', 'concentration']].copy()
+                            df_for_excel['date'] = df_for_excel['date'].dt.strftime('%d/%m/%Y')
+                            excel_data = to_excel_custom(df_for_excel, selected_label, poll)
+                            st.download_button(
+                                "Excel 📥",
+                                data=excel_data,
+                                file_name=f"{selected_label}_{poll}.xlsx",
+                                key=f"dl_{selected_id}_{poll}"
+                            )
+                        # Create figure
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=poll_data['date'].dt.strftime('%d/%m/%Y'),
+                            y=poll_data['concentration'],
+                            mode='lines+markers',
+                            line=dict(color='#3b82f6', width=3),
+                            marker=dict(size=8, color='#1e293b', line=dict(width=2, color='#3b82f6')),
+                            fill='tozeroy',
+                            fillcolor='rgba(59, 130, 246, 0.05)',
+                            name=f"ריכוז (מ\"ג/מק\"ת)",
+                            hovertemplate="תאריך: %{x}<br>ריכוז: %{y:.1f} מ\"ג/מק\"ת<extra></extra>"
+                        ))
+                        if threshold > 0:
+                            fig.add_hline(
+                                y=threshold,
+                                line_dash="dash",
+                                line_color="#ef4444",
+                                annotation_text=f"סף תקן: {threshold} מ\"ג/מק\"ת",
+                                annotation_position="top left"
+                            )
+                        fig.update_layout(
+                            title={
+                                'text': f"<b>{selected_label} - {poll}</b><br><span style='font-size:14px; color:gray;'>(מ\"ג/מק\"ת)</span>",
+                                'y': 0.95,
+                                'x': 0.5,
+                                'xanchor': 'center',
+                                'yanchor': 'top'
+                            },
+                            # Slightly smaller graph height to allow multiple plots to fit comfortably on screen
+                            height=280,
+                            margin=dict(l=20, r=20, t=70, b=20),
+                            template="plotly_white",
+                            xaxis=dict(type='category', gridcolor='#f0f2f6', title="תאריך דיגום"),
+                            yaxis=dict(gridcolor='#f0f2f6', title="ריכוז (מ\"ג/מק\"ת)"),
+                            hovermode="x unified",
+                            dragmode="zoom"
+                        )
+                        st.plotly_chart(
+                            fig,
+                            use_container_width=True,
+                            config={
+                                'displaylogo': False,
+                                'toImageButtonOptions': {
+                                    'format': 'png',
+                                    'filename': f'{selected_label}_{poll}',
+                                    'height': 800,
+                                    'width': 1200,
+                                    'scale': 2
+                                }
+                            },
+                            key=f"chart_{selected_id}_{poll}"
+                        )
+                        st.markdown('</div>', unsafe_allow_html=True)
     else:
-        st.info("אנא העלה קבצים בתפריט הצד.")
+        st.info("אנא העלה קבצים באמצעות כפתור ההעלאה למעלה.")
 
 # (שאר הקוד של לשונית הגדרות וניהול נתונים נשאר זהה...)
 with tab2:
