@@ -43,6 +43,17 @@ DB_FILE = "stack_db.json"
 # --- פונקציות ליבה ---
 
 def load_data():
+    """
+    Load the persisted database from disk.  The JSON structure holds the following keys:
+      - samples: list of measurement dicts (pollutant, concentration, date, chimney_id, filename)
+      - thresholds: nested dict of threshold values keyed by chimney_id and pollutant name
+      - hashes: list of MD5 hashes of previously uploaded files (used to prevent duplicates)
+      - chimney_names: mapping of chimney_id to a user friendly name
+      - plants: mapping of chimney_id to the plant name it belongs to
+
+    Returns a tuple (df, thresholds, file_hashes, chimney_names, plants).
+    If the file does not exist or cannot be parsed, sensible defaults are returned.
+    """
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, "r", encoding="utf-8") as f:
@@ -52,19 +63,32 @@ def load_data():
                     df['date'] = pd.to_datetime(df['date'], errors='coerce')
                     df = df.dropna(subset=['date'])
                     # Normalise pollutant names on load – collapse any consecutive whitespace so that
-                    # "תחמוצות  גופרית" and "תחמוצות גופרית" are treated the same.  This ensures
-                    # consistency across sessions and between uploads and persisted data.
+                    # "תחמוצות  גופרית" and "תחמוצות גופרית" are treated the same.
                     if 'pollutant' in df.columns:
                         df['pollutant'] = df['pollutant'].astype(str).apply(lambda x: " ".join(x.split()))
-                return df, data.get("thresholds", {}), set(data.get("hashes", [])), data.get("chimney_names", {})
-        except: pass
-    return pd.DataFrame(columns=["pollutant", "concentration", "date", "chimney_id", "filename"]), {}, set(), {}
+                thresholds = data.get("thresholds", {})
+                file_hashes = set(data.get("hashes", []))
+                chimney_names = data.get("chimney_names", {})
+                plants = data.get("plants", {})
+                return df, thresholds, file_hashes, chimney_names, plants
+        except Exception:
+            pass
+    # Fallback defaults
+    return pd.DataFrame(columns=["pollutant", "concentration", "date", "chimney_id", "filename"]), {}, set(), {}, {}
 
-def save_data(df, thresholds, file_hashes, chimney_names):
+def save_data(df, thresholds, file_hashes, chimney_names, plants):
+    """Persist the current in-memory state to disk."""
     df_to_save = df.copy()
     if not df_to_save.empty:
+        # Store dates as strings to avoid JSON serialisation issues
         df_to_save['date'] = df_to_save['date'].dt.strftime('%Y-%m-%d %H:%M:%S')
-    data = {"samples": df_to_save.to_dict(orient="records"), "thresholds": thresholds, "hashes": list(file_hashes), "chimney_names": chimney_names}
+    data = {
+        "samples": df_to_save.to_dict(orient="records"),
+        "thresholds": thresholds,
+        "hashes": list(file_hashes),
+        "chimney_names": chimney_names,
+        "plants": plants,
+    }
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
@@ -90,6 +114,48 @@ def to_excel_custom(df, chimney_name, pollutant_name):
         worksheet.merge_cells('A1:B1')
         worksheet['A1'] = header_text
         
+    return output.getvalue()
+
+
+# פונקציה ליצוא נתונים של מספר מזהמים ו/או ארובות לקובץ אקסל עם כותרת מותאמת
+def to_excel_multi(df: pd.DataFrame, header_text: str):
+    """
+    Export a DataFrame containing multiple chimneys and pollutants to an Excel file with a custom header.
+
+    The DataFrame is expected to have at least the columns: 'chimney_id', 'pollutant', 'date', 'concentration'.
+    The resulting spreadsheet will include Hebrew column names and a merged header row.
+    """
+    output = io.BytesIO()
+    if df.empty:
+        # Create an empty Excel with header text only
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            workbook = writer.book
+            sheet = workbook.create_sheet('נתוני דיגום')
+            sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=4)
+            sheet['A1'] = header_text
+        return output.getvalue()
+
+    export_df = df.copy()
+    # Rename columns to Hebrew for end users
+    rename_map = {
+        'chimney_id': 'ארובה',
+        'pollutant': 'מזהם',
+        'date': 'תאריך דיגום',
+        'concentration': 'ריכוז (מ"ג/מק"ת)',
+    }
+    export_df = export_df.rename(columns={k: v for k, v in rename_map.items() if k in export_df.columns})
+    # Format dates nicely
+    if 'תאריך דיגום' in export_df.columns:
+        export_df['תאריך דיגום'] = pd.to_datetime(export_df['תאריך דיגום'], errors='coerce').dt.strftime('%d/%m/%Y')
+    # Write to Excel
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        export_df.to_excel(writer, index=False, sheet_name='נתוני דיגום', startrow=2)
+        workbook = writer.book
+        worksheet = writer.sheets['נתוני דיגום']
+        # Merge cells across the number of columns to create a single header
+        num_cols = export_df.shape[1]
+        worksheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=num_cols)
+        worksheet['A1'] = header_text
     return output.getvalue()
 
 def process_excel(uploaded_file):
@@ -169,7 +235,13 @@ def process_excel(uploaded_file):
 
 # --- Session State ---
 if 'db' not in st.session_state:
-    st.session_state.db, st.session_state.thresholds, st.session_state.file_hashes, st.session_state.chimney_names = load_data()
+    (
+        st.session_state.db,
+        st.session_state.thresholds,
+        st.session_state.file_hashes,
+        st.session_state.chimney_names,
+        st.session_state.plants,
+    ) = load_data()
 
 # --- ממשק משתמש ---
 
@@ -193,77 +265,96 @@ with st.sidebar:
                     added = True
         if added:
             st.session_state.db['date'] = pd.to_datetime(st.session_state.db['date'])
-            save_data(st.session_state.db, st.session_state.thresholds, st.session_state.file_hashes, st.session_state.chimney_names)
+            save_data(
+                st.session_state.db,
+                st.session_state.thresholds,
+                st.session_state.file_hashes,
+                st.session_state.chimney_names,
+                st.session_state.plants,
+            )
             st.rerun()
 
 tab1, tab2, tab3 = st.tabs(["📈 דשבורד", "⚙️ הגדרות ארובות", "💾 ניהול מסד נתונים"])
 
 with tab1:
     if not st.session_state.db.empty:
-        raw_ids = sorted(st.session_state.db['chimney_id'].unique())
-        id_to_label = {cid: st.session_state.chimney_names.get(cid, f"ארובה {cid}") for cid in raw_ids}
-        
-        selected_label = st.selectbox("בחר ארובה לתצוגה:", options=list(id_to_label.values()))
-        selected_id = [k for k, v in id_to_label.items() if v == selected_label][0]
-        
-        c_data = st.session_state.db[st.session_state.db['chimney_id'] == selected_id]
-        
-        for poll in sorted(c_data['pollutant'].unique()):
-            poll_data = c_data[c_data['pollutant'] == poll].sort_values('date')
-            threshold = int(st.session_state.thresholds.get(selected_id, {}).get(poll, 0))
-            
-            st.markdown(f'<div class="graph-card">', unsafe_allow_html=True)
-            
-            col_spacer, col_dl = st.columns([10, 1.5])
-            with col_dl:
-                # שימוש בפונקציה החדשה לייצוא עם כותרות
-                df_for_excel = poll_data[['date', 'concentration']].copy()
-                df_for_excel['date'] = df_for_excel['date'].dt.strftime('%d/%m/%Y')
-                excel_data = to_excel_custom(df_for_excel, selected_label, poll)
-                st.download_button("Excel 📥", data=excel_data, file_name=f"{selected_label}_{poll}.xlsx", key=f"dl_{selected_id}_{poll}")
-
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=poll_data['date'].dt.strftime('%d/%m/%Y'),
-                y=poll_data['concentration'],
-                mode='lines+markers',
-                line=dict(color='#3b82f6', width=4),
-                marker=dict(size=10, color='#1e293b', line=dict(width=2, color='#3b82f6')),
-                fill='tozeroy',
-                fillcolor='rgba(59, 130, 246, 0.05)',
-                name=f"ריכוז (מ\"ג/מק\"ת)",
-                hovertemplate="תאריך: %{x}<br>ריכוז: %{y:.1f} מ\"ג/מק\"ת<extra></extra>"
-            ))
-            
-            if threshold > 0:
-                fig.add_hline(y=threshold, line_dash="dash", line_color="#ef4444", 
-                              annotation_text=f"סף תקן: {threshold} מ\"ג/מק\"ת", annotation_position="top left")
-            
-            fig.update_layout(
-                title={
-                    'text': f"<b>{selected_label} - {poll}</b><br><span style='font-size:14px; color:gray;'>(מ\"ג/מק\"ת)</span>",
-                    'y': 0.95, 'x': 0.5, 'xanchor': 'center', 'yanchor': 'top'
-                },
-                height=450,
-                margin=dict(l=20, r=20, t=80, b=20),
-                template="plotly_white",
-                xaxis=dict(type='category', gridcolor='#f0f2f6', title="תאריך דיגום"),
-                yaxis=dict(gridcolor='#f0f2f6', title="ריכוז (מ\"ג/מק\"ת)"),
-                hovermode="x unified",
-                dragmode="zoom"
-            )
-            
-            st.plotly_chart(fig, use_container_width=True, config={
-                'displaylogo': False,
-                'toImageButtonOptions': {
-                    'format': 'png', 
-                    'filename': f'{selected_label}_{poll}',
-                    'height': 800,
-                    'width': 1200,
-                    'scale': 2
-                }
-            }, key=f"chart_{selected_id}_{poll}")
-            st.markdown('</div>', unsafe_allow_html=True)
+        # Group chimneys by plant; default group for unassigned chimneys
+        chimney_ids = sorted(st.session_state.db['chimney_id'].unique())
+        # Determine plant name for each chimney; fallback to 'ללא מפעל'
+        plants_mapping = st.session_state.plants if hasattr(st.session_state, 'plants') else {}
+        plant_names = sorted({plants_mapping.get(cid, 'ללא מפעל') for cid in chimney_ids})
+        # Select plant
+        selected_plant = st.selectbox("בחר מפעל:", options=plant_names)
+        # Filter chimneys belonging to selected plant
+        chimneys_for_plant = [cid for cid in chimney_ids if plants_mapping.get(cid, 'ללא מפעל') == selected_plant]
+        # Build label mapping for those chimneys
+        id_to_label = {cid: st.session_state.chimney_names.get(cid, f"ארובה {cid}") for cid in chimneys_for_plant}
+        if not id_to_label:
+            st.warning("לא נמצאו ארובות במפעל הנבחר.")
+        else:
+            selected_label = st.selectbox("בחר ארובה לתצוגה:", options=list(id_to_label.values()))
+            # Retrieve the corresponding chimney_id
+            selected_id = [k for k, v in id_to_label.items() if v == selected_label][0]
+            # Filter data for the selected chimney
+            c_data = st.session_state.db[st.session_state.db['chimney_id'] == selected_id]
+            # Iterate over pollutants and draw graphs
+            for poll in sorted(c_data['pollutant'].unique()):
+                poll_data = c_data[c_data['pollutant'] == poll].sort_values('date')
+                threshold = int(st.session_state.thresholds.get(selected_id, {}).get(poll, 0))
+                st.markdown(f'<div class="graph-card">', unsafe_allow_html=True)
+                col_spacer, col_dl = st.columns([10, 1.5])
+                with col_dl:
+                    # Export only this pollutant and chimney
+                    df_for_excel = poll_data[['date', 'concentration']].copy()
+                    df_for_excel['date'] = df_for_excel['date'].dt.strftime('%d/%m/%Y')
+                    excel_data = to_excel_custom(df_for_excel, selected_label, poll)
+                    st.download_button("Excel 📥", data=excel_data, file_name=f"{selected_label}_{poll}.xlsx", key=f"dl_{selected_id}_{poll}")
+                # Create figure
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=poll_data['date'].dt.strftime('%d/%m/%Y'),
+                    y=poll_data['concentration'],
+                    mode='lines+markers',
+                    line=dict(color='#3b82f6', width=3),
+                    marker=dict(size=8, color='#1e293b', line=dict(width=2, color='#3b82f6')),
+                    fill='tozeroy',
+                    fillcolor='rgba(59, 130, 246, 0.05)',
+                    name=f"ריכוז (מ\"ג/מק\"ת)",
+                    hovertemplate="תאריך: %{x}<br>ריכוז: %{y:.1f} מ\"ג/מק\"ת<extra></extra>"
+                ))
+                if threshold > 0:
+                    fig.add_hline(y=threshold, line_dash="dash", line_color="#ef4444",
+                                  annotation_text=f"סף תקן: {threshold} מ\"ג/מק\"ת", annotation_position="top left")
+                fig.update_layout(
+                    title={
+                        'text': f"<b>{selected_label} - {poll}</b><br><span style='font-size:14px; color:gray;'>(מ\"ג/מק\"ת)</span>",
+                        'y': 0.95, 'x': 0.5, 'xanchor': 'center', 'yanchor': 'top'
+                    },
+                    # Slightly smaller graph height to allow multiple plots to fit comfortably on screen
+                    height=280,
+                    margin=dict(l=20, r=20, t=70, b=20),
+                    template="plotly_white",
+                    xaxis=dict(type='category', gridcolor='#f0f2f6', title="תאריך דיגום"),
+                    yaxis=dict(gridcolor='#f0f2f6', title="ריכוז (מ\"ג/מק\"ת)"),
+                    hovermode="x unified",
+                    dragmode="zoom"
+                )
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                    config={
+                        'displaylogo': False,
+                        'toImageButtonOptions': {
+                            'format': 'png',
+                            'filename': f'{selected_label}_{poll}',
+                            'height': 800,
+                            'width': 1200,
+                            'scale': 2
+                        }
+                    },
+                    key=f"chart_{selected_id}_{poll}"
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
     else:
         st.info("אנא העלה קבצים בתפריט הצד.")
 
@@ -274,13 +365,33 @@ with tab2:
         ids = sorted(st.session_state.db['chimney_id'].unique())
         for cid in ids:
             with st.expander(f"⚙️ הגדרות ארובה: {st.session_state.chimney_names.get(cid, cid)}", expanded=True):
+                # Two columns: edit chimney name and assign plant
                 col1, col2 = st.columns([1, 1])
                 with col1:
                     old_name = st.session_state.chimney_names.get(cid, "")
                     new_name = st.text_input(f"שם הארובה (ID: {cid})", value=old_name, key=f"edit_name_{cid}")
                     if new_name != old_name:
                         st.session_state.chimney_names[cid] = new_name
-                        save_data(st.session_state.db, st.session_state.thresholds, st.session_state.file_hashes, st.session_state.chimney_names)
+                        save_data(
+                            st.session_state.db,
+                            st.session_state.thresholds,
+                            st.session_state.file_hashes,
+                            st.session_state.chimney_names,
+                            st.session_state.plants,
+                        )
+                        st.rerun()
+                with col2:
+                    old_plant = st.session_state.plants.get(cid, "") if hasattr(st.session_state, 'plants') else ""
+                    new_plant = st.text_input(f"שם המפעל (ID: {cid})", value=old_plant, key=f"edit_plant_{cid}")
+                    if new_plant != old_plant:
+                        st.session_state.plants[cid] = new_plant
+                        save_data(
+                            st.session_state.db,
+                            st.session_state.thresholds,
+                            st.session_state.file_hashes,
+                            st.session_state.chimney_names,
+                            st.session_state.plants,
+                        )
                         st.rerun()
                 
                 st.markdown("---")
@@ -289,24 +400,145 @@ with tab2:
                 cols = st.columns(3)
                 for idx, p_name in enumerate(chimney_pollutants):
                     with cols[idx % 3]:
-                        if cid not in st.session_state.thresholds: st.session_state.thresholds[cid] = {}
+                        if cid not in st.session_state.thresholds:
+                            st.session_state.thresholds[cid] = {}
                         curr_limit = int(st.session_state.thresholds[cid].get(p_name, 0))
-                        new_limit = st.number_input(f"סף {p_name}", value=curr_limit, key=f"limit_{cid}_{p_name}", step=1)
+                        new_limit = st.number_input(
+                            f"סף {p_name}",
+                            value=curr_limit,
+                            key=f"limit_{cid}_{p_name}",
+                            step=1
+                        )
                         if new_limit != curr_limit:
                             st.session_state.thresholds[cid][p_name] = int(new_limit)
-                            save_data(st.session_state.db, st.session_state.thresholds, st.session_state.file_hashes, st.session_state.chimney_names)
+                            save_data(
+                                st.session_state.db,
+                                st.session_state.thresholds,
+                                st.session_state.file_hashes,
+                                st.session_state.chimney_names,
+                                st.session_state.plants,
+                            )
     else:
         st.info("העלה נתונים כדי להתחיל בהגדרות.")
 
 with tab3:
     st.markdown("<h2 class='settings-header'>💾 ניהול נתונים</h2>", unsafe_allow_html=True)
     if not st.session_state.db.empty:
-        files = st.session_state.db[['filename', 'chimney_id', 'date']].drop_duplicates().copy()
-        files['display'] = files.apply(lambda x: f"{x['filename']} ({st.session_state.chimney_names.get(x['chimney_id'], x['chimney_id'])} - {x['date'].strftime('%d/%m/%Y')})", axis=1)
-        
-        to_del = st.multiselect("בחר קבצים להסרה מהמערכת:", options=files['display'].tolist())
-        if st.button("מחק לצמיתות", type="primary"):
-            filenames = [d.split(" (")[0] for d in to_del]
-            st.session_state.db = st.session_state.db[~st.session_state.db['filename'].isin(filenames)]
-            save_data(st.session_state.db, st.session_state.thresholds, st.session_state.file_hashes, st.session_state.chimney_names)
-            st.rerun()
+        # Build plant and chimney selection for file management
+        chimney_ids_dm = sorted(st.session_state.db['chimney_id'].unique())
+        plants_mapping_dm = st.session_state.plants if hasattr(st.session_state, 'plants') else {}
+        plant_names_dm = sorted({plants_mapping_dm.get(cid, 'ללא מפעל') for cid in chimney_ids_dm})
+        selected_plant_dm = st.selectbox("בחר מפעל לניהול קבצים:", options=plant_names_dm, key="dm_plant")
+        chimneys_in_plant_dm = [cid for cid in chimney_ids_dm if plants_mapping_dm.get(cid, 'ללא מפעל') == selected_plant_dm]
+        if not chimneys_in_plant_dm:
+            st.info("אין ארובות במפעל זה.")
+        else:
+            id_to_label_dm = {cid: st.session_state.chimney_names.get(cid, f"ארובה {cid}") for cid in chimneys_in_plant_dm}
+            selected_label_dm = st.selectbox("בחר ארובה לניהול קבצים:", options=list(id_to_label_dm.values()), key="dm_chimney")
+            selected_chimney_dm = [k for k, v in id_to_label_dm.items() if v == selected_label_dm][0]
+            # List files associated with this chimney and provide download/delete options
+            sub_files = st.session_state.db[
+                st.session_state.db['chimney_id'] == selected_chimney_dm
+            ][['filename', 'date']].drop_duplicates().copy()
+            if sub_files.empty:
+                st.info("אין קבצי דיגום לארובה זו.")
+            else:
+                # Create a human‑readable label for each file including the date
+                sub_files['display'] = sub_files.apply(
+                    lambda x: f"{x['filename']} ({x['date'].strftime('%d/%m/%Y')})", axis=1
+                )
+                st.markdown("### 📁 הורדה או מחיקה של קובצי דיגום")
+                # File selection for download
+                selected_file_disp = st.selectbox(
+                    "בחר קובץ להורדה:",
+                    options=["--"] + sub_files['display'].tolist(),
+                    key="dm_download_file"
+                )
+                if selected_file_disp and selected_file_disp != "--":
+                    # Parse file name and date from display label
+                    file_name_part = selected_file_disp.split(" (")[0]
+                    date_part = selected_file_disp.split(" (")[1].rstrip(")")
+                    # Filter database for the selected file (by chimney, file name and date)
+                    export_file_df = st.session_state.db[
+                        (st.session_state.db['chimney_id'] == selected_chimney_dm)
+                        & (st.session_state.db['filename'] == file_name_part)
+                        & (st.session_state.db['date'].dt.strftime('%d/%m/%Y') == date_part)
+                    ]
+                    # Build a descriptive header for this file export
+                    header_file = f"דוח נתוני דיגום: {selected_plant_dm} | {selected_label_dm} | תאריך: {date_part}"
+                    excel_file_dm = to_excel_multi(export_file_df, header_file)
+                    st.download_button(
+                        "הורד קובץ דיגום 📥",
+                        data=excel_file_dm,
+                        file_name=f"{selected_label_dm}_{date_part}.xlsx",
+                        key=f"dl_file_{selected_file_disp}"
+                    )
+                # Multi‑select for deletion
+                to_del_dm = st.multiselect(
+                    "בחר קבצי דיגום להסרה מהמערכת:",
+                    options=sub_files['display'].tolist(),
+                    key="dm_files"
+                )
+                if st.button("מחק קבצים לצמיתות", type="primary"):
+                    filenames_dm = [d.split(" (")[0] for d in to_del_dm]
+                    dates_dm = [d.split(" (")[1].rstrip(")") for d in to_del_dm]
+                    # Remove rows matching both file name and date for this chimney
+                    mask = (
+                        (st.session_state.db['chimney_id'] == selected_chimney_dm) &
+                        (st.session_state.db['filename'].isin(filenames_dm)) &
+                        (st.session_state.db['date'].dt.strftime('%d/%m/%Y').isin(dates_dm))
+                    )
+                    st.session_state.db = st.session_state.db[~mask]
+                    save_data(
+                        st.session_state.db,
+                        st.session_state.thresholds,
+                        st.session_state.file_hashes,
+                        st.session_state.chimney_names,
+                        st.session_state.plants,
+                    )
+                    st.rerun()
+            # Export data section
+            st.markdown("---")
+            st.markdown("### 📤 יצוא נתונים לאקסל")
+            # Available pollutants for export from the current plant selection
+            pollutant_options_dm = sorted(
+                st.session_state.db[
+                    st.session_state.db['chimney_id'].isin(chimneys_in_plant_dm)
+                ]['pollutant'].unique()
+            )
+            export_pollutants_dm = st.multiselect(
+                "בחר מזהמים ליצוא:",
+                options=pollutant_options_dm,
+                default=pollutant_options_dm,
+                key="export_pollutants_dm"
+            )
+            export_scope_dm = st.selectbox(
+                "בחר טווח יצוא:",
+                options=["ארובה ספציפית", "כל הארובות במפעל הנבחר", "כל הארובות"],
+                key="export_scope_dm"
+            )
+            # Build DataFrame for export based on scope
+            if export_scope_dm == "ארובה ספציפית":
+                export_df_dm = st.session_state.db[
+                    (st.session_state.db['chimney_id'] == selected_chimney_dm) &
+                    (st.session_state.db['pollutant'].isin(export_pollutants_dm))
+                ]
+                header_dm = f"דוח נתוני דיגום: {selected_plant_dm} | {selected_label_dm} | מזהמים: {', '.join(export_pollutants_dm)}"
+            elif export_scope_dm == "כל הארובות במפעל הנבחר":
+                export_df_dm = st.session_state.db[
+                    (st.session_state.db['chimney_id'].isin(chimneys_in_plant_dm)) &
+                    (st.session_state.db['pollutant'].isin(export_pollutants_dm))
+                ]
+                header_dm = f"דוח נתוני דיגום: {selected_plant_dm} | כל הארובות | מזהמים: {', '.join(export_pollutants_dm)}"
+            else:  # "כל הארובות"
+                export_df_dm = st.session_state.db[
+                    st.session_state.db['pollutant'].isin(export_pollutants_dm)
+                ]
+                header_dm = f"דוח נתוני דיגום: כל המפעלים | כל הארובות | מזהמים: {', '.join(export_pollutants_dm)}"
+            if export_df_dm.empty:
+                st.info("אין נתונים לייצוא לפי הסינון שנבחר.")
+            else:
+                excel_multi_dm = to_excel_multi(export_df_dm, header_dm)
+                st.download_button(
+                    "יצא לאקסל 📥", data=excel_multi_dm, file_name="exported_data.xlsx", key="export_multi_dm"
+                )
